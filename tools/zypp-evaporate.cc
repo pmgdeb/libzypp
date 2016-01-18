@@ -47,6 +47,7 @@ int usage( const std::string & msg_r = std::string(), int exit_r = 100 )
   cerr << "Evaporate the set of installed packages to a minimum, so " << endl;
   cerr << "their dependencies still span the whole system." << endl;
   cerr << "" << endl;
+  cerr << "-g, --graph      Write dependency graph to E.dot (graphviz)." << endl;
   cerr << "-h               Display this help." << endl;
   cerr << "-p               Consider only packages." << endl;
   cerr << "-r, --root DIR   Use system rooted at DIR." << endl;
@@ -105,6 +106,7 @@ namespace graph
     const indices & outSet() const		{ return _out; }
 
     bool isolated() const			{ return( inEmpty() && outEmpty() ); }
+    bool isSeed() const				{ return inEmpty(); }
 
   private:
     friend class Graph;
@@ -127,6 +129,7 @@ namespace graph
       str << "Node[]";
     return str;
   }
+
 
   ///////////////////////////////////////////////////////////////////
   struct Graph
@@ -225,7 +228,6 @@ namespace graph
       }
     }
 
-
   public:
     // print Node indices on stream
     template <typename TStream>
@@ -290,6 +292,15 @@ namespace graph
       }
     }
     return str << "\n} [ nodes:" << nodes << ", edges:" << edges << " ]";
+  }
+
+  indices filter(const Graph & g_r,  bool (Node::*predicate_r)() const = 0 )
+  {
+    indices ret;
+    for ( const Node & node : g_r )
+      if ( node && ( !predicate_r || (node.*predicate_r)() ) )
+	ret.insert( node.id() );
+    return ret;
   }
 
   ///////////////////////////////////////////////////////////////////
@@ -410,14 +421,23 @@ namespace graph
   { return tarjan::Algorithm( g, allsccs_r ).result(); }
 
   /// Graph as dot file
-  std::ostream & writeGraphviz( std::ostream & str, const Graph & g_r, const std::string & name_r = "G" )
+  std::ostream & writeGraphviz( std::ostream & str, const Graph & g_r, const std::string & name_r,
+				const indices & high = indices() )
   {
     str << "digraph " << name_r << " {" << endl;
 
     for ( const Node & v : g_r )
       if ( v )
-	str << v.id() << " [label=\"" << sat::Solvable(v.id()).asString() << "\"];" << endl;
-
+      {
+	sat::Solvable solv( v.id() );
+	str << v.id()
+	    << " [label=\"" << solv.ident() << "\""
+	    << " vers=\"" << solv.edition() << "\""
+	    << " arch=\"" << solv.arch() << "\"";
+	if ( high.count( v.id() ) )
+	  str << " color=\"red\"";
+	str << "];" << endl;
+      }
     for ( const Node & v : g_r )
       if ( v && !v.outEmpty() )
 	dumpRange( str << v.id() << " -> ",
@@ -430,31 +450,49 @@ namespace graph
 } // namespace graph
 ///////////////////////////////////////////////////////////////////
 
-std::ostream & writeResult( std::ostream & str, const graph::Graph & g_r )
+std::ostream & writeResult( std::ostream & str, const graph::indices & indices_r )
 {
   str << "Evaporated {" << endl;
   unsigned count = 0;
-  for ( const graph::Node & node : g_r )
+  for ( graph::index_t id : indices_r )
   {
-    if ( node )
-    {
-      str << "  " << sat::Solvable(node).asString() << endl;
-      ++count;
-    }
+    str << "  " << sat::Solvable(id).asString() << endl;
+    ++count;
   }
   str << "} [ solvables:" << count << " ]" << endl;
   return str;
 }
+
+template <typename TStream>
+TStream & dumpIndices( TStream & str, const graph::indices & indices_r )
+{
+  if ( indices_r.empty() )
+    str << "{}";
+  else
+  {
+    str << "{";
+    for ( graph::index_t idx : indices_r )
+      str << " " << idx;
+    str << " }";
+  }
+  return str;
+}
+
 
 int main( int argc, const char * argv[] )
 {
   appname = Pathname::basename( argv[0] );
   Pathname sysRoot("/");
   Pathname solvFile;
+  bool writeGraphviz = false;
 
   while ( POPARG )
   {
-    if ( argCheck( *argv, { "-h", "--help" } ) )
+    if ( argCheck( *argv, { "-g", "--graph" } ) )
+    {
+      writeGraphviz = true;
+    }
+    else if ( argCheck( *argv, { "-h", "--help" } ) )
     {
       exit( usage( "", 0 ) );
     }
@@ -539,8 +577,7 @@ int main( int argc, const char * argv[] )
   msg << "  Dependencies: " << dcount << endl;
   dmsg << g << endl;
 
-#if 1
-  // Check for cycles
+  // Check and reduce cycles (strongly connected components)
   msg << "Checking for dependency  cycles..." << endl;
   std::list<graph::indices> sccs( graph::scc( g ) );
   msg << "  Cycles: " << sccs.size() << endl;
@@ -562,42 +599,19 @@ int main( int argc, const char * argv[] )
     if ( !dmsg )
       cerr << endl;
   }
-#endif
 
-  // Evaporate requirements graph
-  unsigned cycle = 0;
-  while ( true )
-  {
-    graph::index_t id = graph::noindex;
-    for ( graph::Node & node : g )
-    {
-      if ( node.outCount() )
-      {
-	if ( id == graph::noindex
-	  || node.inCount() < g[id].inCount()
-	  || ( node.inCount() == g[id].inCount() && node.outCount() > g[id].outCount() ) )
-	  id = node.id();
-      }
-    }
-    if ( id == graph::noindex )
-      break;	// no more nodes to process
+  // Extract the seeds (Nodes with no incoming edge)
+  const graph::indices & seeds( graph::filter( g, &graph::Node::isSeed ) );
+  msg << "Seeds: " << seeds.size() << endl;
+  g.dumpIndicesOn( dmsg << "Evaporated Graph", seeds ) << endl;
 
-    dmsg << ++cycle << " select " << g[id] << endl;
-    g.evaporate( g[id] );
-  }
-
-  if ( 0 ) {
-    std::ofstream str( "G.dot" );
-    graph::writeGraphviz( str, o );
-  }
-  if ( 0 ) {
+  if ( writeGraphviz ) {
+    msg << "Wrinting graphviz to file E.dot" << endl;
     std::ofstream str( "E.dot" );
-    graph::writeGraphviz( str, g );
+    graph::writeGraphviz( str, o, "Evaporated", seeds );
   }
-  msg << "Evaporated " << g << endl;
-  //graph::writeGraphviz( cout, g, "Evaporated" );
 
   // Result:
-  writeResult( cout, g );
+  writeResult( cout, seeds );
   return 0;
 }
